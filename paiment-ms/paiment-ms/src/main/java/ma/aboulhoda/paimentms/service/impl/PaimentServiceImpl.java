@@ -1,29 +1,23 @@
 package ma.aboulhoda.paimentms.service.impl;
 
-
 import ma.aboulhoda.paimentms.bean.Paiment;
 import ma.aboulhoda.paimentms.dao.PaimentDao;
 import ma.aboulhoda.paimentms.service.facade.PaimentService;
+import ma.aboulhoda.paimentms.service.requirede.CommandeController; // Add Feign client interface
 import ma.aboulhoda.paimentms.ws.dto.CommandeDto;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestTemplate;
+
+import java.math.BigDecimal;
 
 @Service
 public class PaimentServiceImpl implements PaimentService {
 
-    private final PaimentDao dao;
-    private final RestTemplate restTemplate;
-    @Value("${app.api.commande}")
-    private String commandeBaseUrl;
+    @Autowired
+    private PaimentDao dao;
 
     @Autowired
-    public PaimentServiceImpl(PaimentDao dao, RestTemplate restTemplate) {
-        this.dao = dao;
-        this.restTemplate = restTemplate;
-    }
-
+    private CommandeController commandeController; // Inject Feign client
 
     @Override
     public Paiment findByCode(String code) {
@@ -31,39 +25,49 @@ public class PaimentServiceImpl implements PaimentService {
     }
 
     private int validateSave(Paiment paiment) {
-        if (findByCode(paiment.getCode()) != null) return -1;
+        if (findByCode(paiment.getCode()) != null) {
+            return -1;
+        }
+        CommandeDto commandeDto = commandeController.findCommandeByRef(paiment.getCommandeRef());
 
-        CommandeDto commandeDto = findCommandeByRef(paiment.getCommandeRef());
+        if (commandeDto == null) {
+            return -3; // Commande not found
+        }
 
-        if (commandeDto.getTotalPaye().add(paiment.getMontant()).compareTo(commandeDto.getTotal()) > 0) return -2;
+        BigDecimal totalPaye = commandeDto.getTotalPaye() != null ? commandeDto.getTotalPaye() : BigDecimal.ZERO;
+        BigDecimal total = commandeDto.getTotal() != null ? commandeDto.getTotal() : BigDecimal.ZERO;
 
-        return 1;
+        if (totalPaye.add(paiment.getMontant()).compareTo(total) > 0) {
+            return -2; // Payment amount exceeds the remaining balance
+        }
+
+        return 1; // Validation successful
     }
 
     @Override
     public int save(Paiment paiment) {
-        int result = validateSave(paiment);
-        if (result > 0) {
-            CommandeDto commandeDto = findCommandeByRef(paiment.getCommandeRef());
-            commandeDto.setTotalPaye(paiment.getMontant().add(commandeDto.getTotalPaye()));
+        int validationResult = validateSave(paiment);
 
-            int response = updateCommande(commandeDto);
+        if (validationResult > 0) {
+            // Fetch the associated commande
+            CommandeDto commandeDto = commandeController.findCommandeByRef(paiment.getCommandeRef());
 
-            if (response > 0) {
+            // Update the total paid amount
+            BigDecimal totalPaye = commandeDto.getTotalPaye() != null ? commandeDto.getTotalPaye() : BigDecimal.ZERO;
+            commandeDto.setTotalPaye(totalPaye.add(paiment.getMontant()));
+
+            // Update the commande in the external service
+            int updateResponse = commandeController.updateCommande(paiment.getCommandeRef(), commandeDto);
+
+            if (updateResponse > 0) {
+                // Save the payment
                 dao.save(paiment);
+                return 1; // Payment saved successfully
+            } else {
+                return -4; // Failed to update commande
             }
-            return response;
         }
-        return result;
-    }
 
-    private CommandeDto findCommandeByRef(String ref) {
-        String url = commandeBaseUrl + "/ref/" + ref;
-        return restTemplate.getForEntity(url, CommandeDto.class).getBody();
-    }
-
-    private int updateCommande(CommandeDto commandeDto) {
-        String url = commandeBaseUrl + "/ref/" + commandeDto.getRef();
-        return restTemplate.postForEntity(url, commandeDto, Integer.class).getBody();
+        return validationResult; // Return validation error code
     }
 }
